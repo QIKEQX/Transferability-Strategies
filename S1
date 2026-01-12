@@ -1,0 +1,344 @@
+// ============================
+// Sentinel-1 数据预处理和导出
+// VV/VH双极化数据提取
+// ============================
+
+// 1. 设置研究区域和时间参数
+var roi = table;  // 替换为您的研究区域
+var region = roi.geometry();
+Map.centerObject(roi, 10);
+
+var startDate = '2020-01-01';
+var endDate = '2020-12-31';
+
+var outFolder = 'Sentinel1_Processed';
+var exportScale = 10;  // Sentinel-1 分辨率为10米
+var exportCRS = 'EPSG:4326';
+var maxPixels = 1e13;
+
+// 显示研究区域
+var styling = {color: 'red', fillColor: '00000000'};
+Map.addLayer(roi.style(styling), {}, 'ROI');
+
+// ============================
+// 2. 加载和筛选Sentinel-1数据
+// ============================
+print('=== Loading Sentinel-1 Data ===');
+
+var sentinel1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(region)
+  .filterDate(startDate, endDate)
+  // 筛选VV和VH双极化
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  // 筛选IW模式（干涉宽幅模式）
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  // 可选：筛选升轨或降轨
+  .filter(ee.Filter.eq('orbitProperties_pass', 'ASCENDING'));  // 或 'DESCENDING'
+
+print('Sentinel-1 image count:', sentinel1.size());
+print('Sentinel-1 collection:', sentinel1);
+
+// ============================
+// 3. 数据预处理
+// ============================
+
+// 3.1 地形校正（可选但推荐）
+function terrainCorrection(image) {
+  // 加载SRTM DEM
+  var dem = ee.Image('USGS/SRTMGL1_003');
+  
+  // 提取坡度和坡向
+  var slope = ee.Terrain.slope(dem);
+  var aspect = ee.Terrain.aspect(dem);
+  
+  // 简化的地形校正（实际应用中可能需要更复杂的方法）
+  // 这里仅添加DEM作为辅助波段
+  return image.addBands(dem.select('elevation'))
+              .addBands(slope.rename('slope'))
+              .addBands(aspect.rename('aspect'));
+}
+
+// 3.2 转换为自然单位（线性单位）
+function toNaturalUnits(image) {
+  // Sentinel-1数据以dB存储，转换为线性单位
+  // Linear = 10^(dB/10)
+  return ee.Image(10).pow(image.divide(10))
+    .copyProperties(image, ['system:time_start']);
+}
+
+// 3.3 应用预处理
+var s1Processed = sentinel1
+  .map(terrainCorrection)
+  .map(toNaturalUnits);
+
+print('Processed S1 collection:', s1Processed);
+
+// ============================
+// 4. 统计量计算
+// ============================
+
+// 4.1 计算平均值
+var s1Mean = s1Processed.select(['VV', 'VH']).mean().clip(region);
+
+// 4.2 计算中位数
+var s1Median = s1Processed.select(['VV', 'VH']).median().clip(region);
+
+// 4.3 计算四分位数（p25, p50, p75）
+var s1Percentiles = s1Processed.select(['VV', 'VH'])
+  .reduce(ee.Reducer.percentile([25, 50, 75]))
+  .clip(region);
+
+// 4.4 计算四分位距（IQR）- 衡量变异性
+var vvIQR = s1Percentiles.select('VV_p75')
+  .subtract(s1Percentiles.select('VV_p25'))
+  .rename('VV_IQR');
+
+var vhIQR = s1Percentiles.select('VH_p75')
+  .subtract(s1Percentiles.select('VH_p25'))
+  .rename('VH_IQR');
+
+// 4.5 计算VV/VH比值
+var vvVhRatio = s1Mean.select('VV')
+  .divide(s1Mean.select('VH'))
+  .rename('VV_VH_ratio');
+
+// 4.6 计算RVI（雷达植被指数）
+function calculateRVI(image) {
+  var rvi = image.expression(
+    'sqrt(vv / (vv + vh)) * (vv / vh)',
+    {
+      'vv': image.select('VV'),
+      'vh': image.select('VH')
+    }
+  ).rename('RVI');
+  return image.addBands(rvi);
+}
+
+var s1WithRVI = s1Processed.map(calculateRVI);
+var rviMean = s1WithRVI.select('RVI').mean().clip(region);
+
+// ============================
+// 5. 重投影到统一坐标系统
+// ============================
+
+// 所有影像重投影到EPSG:4326，30米分辨率（或保持10米）
+var reprojectParams = {crs: exportCRS, scale: exportScale};
+
+s1Mean = s1Mean.reproject(reprojectParams);
+s1Median = s1Median.reproject(reprojectParams);
+s1Percentiles = s1Percentiles.reproject(reprojectParams);
+vvIQR = vvIQR.reproject(reprojectParams);
+vhIQR = vhIQR.reproject(reprojectParams);
+vvVhRatio = vvVhRatio.reproject(reprojectParams);
+rviMean = rviMean.reproject(reprojectParams);
+
+// 检查投影信息
+print('Projection info:', s1Mean.projection());
+
+// ============================
+// 6. 可视化
+// ============================
+
+// VV波段可视化参数
+var visVV = {
+  bands: ['VV'],
+  min: 0.01,
+  max: 0.5,
+  palette: ['blue', 'green', 'yellow', 'red']
+};
+
+// VH波段可视化参数
+var visVH = {
+  bands: ['VH'],
+  min: 0.001,
+  max: 0.1,
+  palette: ['blue', 'green', 'yellow', 'red']
+};
+
+// IQR可视化参数
+var visIQR = {
+  min: 0,
+  max: 0.1,
+  palette: ['white', 'blue', 'green', 'red']
+};
+
+// RVI可视化参数
+var visRVI = {
+  bands: ['RVI'],
+  min: 0,
+  max: 2,
+  palette: ['brown', 'yellow', 'green', 'darkgreen']
+};
+
+Map.addLayer(s1Mean.select('VV'), visVV, 'S1 VV Mean', false);
+Map.addLayer(s1Mean.select('VH'), visVH, 'S1 VH Mean', false);
+Map.addLayer(vvIQR, visIQR, 'VV IQR', false);
+Map.addLayer(vhIQR, visIQR, 'VH IQR', false);
+Map.addLayer(rviMean, visRVI, 'RVI Mean', true);
+
+// ============================
+// 7. 时间序列图表（可选）
+// ============================
+
+var chart = ui.Chart.image.seriesByRegion({
+  imageCollection: s1WithRVI.select('RVI'),
+  regions: roi,
+  reducer: ee.Reducer.mean(),
+  band: 'RVI',
+  scale: 30,
+  xProperty: 'system:time_start'
+})
+.setSeriesNames(['RVI'])
+.setOptions({
+  title: 'Sentinel-1 RVI Time Series',
+  hAxis: {title: 'Date', titleTextStyle: {italic: false, bold: true}},
+  vAxis: {title: 'RVI', titleTextStyle: {italic: false, bold: true}},
+  lineWidth: 2,
+  colors: ['#fc0303'],
+  curveType: 'function'
+});
+
+print(chart);
+
+// ============================
+// 8. 导出数据到Google Drive
+// ============================
+
+print('=== Creating Export Tasks ===');
+
+// 8.1 导出VV均值（单波段）
+Export.image.toDrive({
+  image: s1Mean.select('VV'),
+  description: 'S1_VV_mean_' + startDate.replace(/-/g, '') + '_' + endDate.replace(/-/g, ''),
+  folder: outFolder,
+  region: region,
+  scale: exportScale,
+  crs: exportCRS,
+  maxPixels: maxPixels,
+  formatOptions: {cloudOptimized: true}
+});
+
+// 8.2 导出VH均值（单波段）
+Export.image.toDrive({
+  image: s1Mean.select('VH'),
+  description: 'S1_VH_mean_' + startDate.replace(/-/g, '') + '_' + endDate.replace(/-/g, ''),
+  folder: outFolder,
+  region: region,
+  scale: exportScale,
+  crs: exportCRS,
+  maxPixels: maxPixels,
+  formatOptions: {cloudOptimized: true}
+});
+
+// 8.3 导出VV中位数（单波段）
+Export.image.toDrive({
+  image: s1Median.select('VV'),
+  description: 'S1_VV_median_' + startDate.replace(/-/g, '') + '_' + endDate.replace(/-/g, ''),
+  folder: outFolder,
+  region: region,
+  scale: exportScale,
+  crs: exportCRS,
+  maxPixels: maxPixels,
+  formatOptions: {cloudOptimized: true}
+});
+
+// 8.4 导出VH中位数（单波段）
+Export.image.toDrive({
+  image: s1Median.select('VH'),
+  description: 'S1_VH_median_' + startDate.replace(/-/g, '') + '_' + endDate.replace(/-/g, ''),
+  folder: outFolder,
+  region: region,
+  scale: exportScale,
+  crs: exportCRS,
+  maxPixels: maxPixels,
+  formatOptions: {cloudOptimized: true}
+});
+
+// 8.5 导出四分位数（分别导出每个波段）
+var percentileBands = ['VV_p25', 'VV_p50', 'VV_p75', 'VH_p25', 'VH_p50', 'VH_p75'];
+
+percentileBands.forEach(function(band) {
+  Export.image.toDrive({
+    image: s1Percentiles.select(band),
+    description: 'S1_' + band + '_' + startDate.replace(/-/g, '') + '_' + endDate.replace(/-/g, ''),
+    folder: outFolder,
+    region: region,
+    scale: exportScale,
+    crs: exportCRS,
+    maxPixels: maxPixels,
+    formatOptions: {cloudOptimized: true}
+  });
+});
+
+// 8.6 导出IQR（单波段）
+Export.image.toDrive({
+  image: vvIQR,
+  description: 'S1_VV_IQR_' + startDate.replace(/-/g, '') + '_' + endDate.replace(/-/g, ''),
+  folder: outFolder,
+  region: region,
+  scale: exportScale,
+  crs: exportCRS,
+  maxPixels: maxPixels,
+  formatOptions: {cloudOptimized: true}
+});
+
+Export.image.toDrive({
+  image: vhIQR,
+  description: 'S1_VH_IQR_' + startDate.replace(/-/g, '') + '_' + endDate.replace(/-/g, ''),
+  folder: outFolder,
+  region: region,
+  scale: exportScale,
+  crs: exportCRS,
+  maxPixels: maxPixels,
+  formatOptions: {cloudOptimized: true}
+});
+
+// 8.7 导出VV/VH比值（单波段）
+Export.image.toDrive({
+  image: vvVhRatio,
+  description: 'S1_VV_VH_ratio_' + startDate.replace(/-/g, '') + '_' + endDate.replace(/-/g, ''),
+  folder: outFolder,
+  region: region,
+  scale: exportScale,
+  crs: exportCRS,
+  maxPixels: maxPixels,
+  formatOptions: {cloudOptimized: true}
+});
+
+// 8.8 导出RVI均值（单波段）
+Export.image.toDrive({
+  image: rviMean,
+  description: 'S1_RVI_mean_' + startDate.replace(/-/g, '') + '_' + endDate.replace(/-/g, ''),
+  folder: outFolder,
+  region: region,
+  scale: exportScale,
+  crs: exportCRS,
+  maxPixels: maxPixels,
+  formatOptions: {cloudOptimized: true}
+});
+
+// ============================
+// 9. 统计信息
+// ============================
+
+print('===========================================');
+print('Sentinel-1 Processing Summary:');
+print('Date range:', startDate, 'to', endDate);
+print('Number of images:', sentinel1.size());
+print('Orbit pass:', 'ASCENDING');
+print('Polarizations: VV, VH');
+print('Export scale:', exportScale, 'm');
+print('Export CRS:', exportCRS);
+print('Output folder:', outFolder);
+print('===========================================');
+print('Export tasks created:');
+print('  - VV mean, median: 2 tasks');
+print('  - VH mean, median: 2 tasks');
+print('  - Percentiles (p25, p50, p75): 6 tasks');
+print('  - IQR (VV, VH): 2 tasks');
+print('  - VV/VH ratio: 1 task');
+print('  - RVI mean: 1 task');
+print('  - TOTAL: 14 tasks');
+print('===========================================');
+print('All export tasks created. Please go to Tasks tab and click RUN ALL.');
