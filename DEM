@@ -1,0 +1,37 @@
+// ===== 1) DEM =====
+var dem = ee.Image('USGS/SRTMGL1_003').select('elevation');
+
+// ===== 2) ROI / parameters =====
+// xmin, ymin, xmax, ymax (EPSG:4326)
+var spatialBounds = ee.Geometry.Rectangle([86, 41, 88, 44], null, false);
+var scale = 30;
+
+Map.setCenter(87, 42, 5);
+
+// ===== 3) Terrain derivatives =====
+var slope = ee.Terrain.slope(dem).rename('slope');
+var aspect = ee.Terrain.aspect(dem).rename('aspect');
+var hillshade = ee.Terrain.hillshade(dem).rename('hillshade');
+
+// ===== 4) Display (optional) =====
+Map.addLayer(dem.clip(spatialBounds), {min: 0, max: 4000}, 'DEM');
+Map.addLayer(slope.clip(spatialBounds), {min: 0, max: 60}, 'Slope');
+Map.addLayer(aspect.clip(spatialBounds), {min: 0, max: 360}, 'Aspect');
+Map.addLayer(hillshade.clip(spatialBounds), {min: 0, max: 255}, 'Hillshade');
+
+// ===== 5) Export =====
+Export.image.toDrive({
+  image: dem.clip(spatialBounds),
+  description: 'DEM_30m',
+  fileNamePrefix: 'DEM_30m',
+  region: spatialBounds,
+  scale: scale,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: slope.clip(spatialBounds),
+  description: 'Slope_30m',
+  fileNamePrefix: 'Slope_30m',
+  region: spati
