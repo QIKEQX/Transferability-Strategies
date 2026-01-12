@@ -1,0 +1,275 @@
+// ============================
+// User settings
+// ============================
+var roi = table;                 // ROI = table
+var region = roi.geometry();     // unified export region
+Map.centerObject(roi, 10);
+
+var startDate   = '2024-05-01';
+var endDate     = '2024-09-30';
+var cloudPctMax = 20;
+
+var outFolder   = 'sentinel_singleband';
+var exportScale = 20;
+var exportCRS   = 'EPSG:4326';
+var maxPixels   = 1e13;
+
+var glcmSize    = 3;             // 3×3 window (odd number)
+var exportAllTextureMetrics = true;  // true=export all texture metrics; false=export keepMetrics only
+
+// Sentinel-2 bands (10/20 m, excluding 60 m bands)
+var s2Bands = ['B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12'];
+
+// Vegetation indices
+var viNames = ['NDVI','GNDVI','EVI','EVI2','DVI','GDVI','RVI','SAVI','OSAVI','MSAVI','NDPI'];
+
+// Common texture metrics (effective only when exportAllTextureMetrics=false)
+var keepMetrics = ['asm','contrast','corr','var','idm','ent','diss','savg'];
+
+function ymd(s){ return s.replace(/-/g,''); }
+var dateTag = ymd(startDate) + '_' + ymd(endDate);
+
+
+// ============================
+// 1) Cloud / shadow mask for S2 SR
+// ============================
+function maskS2sr(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask  = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var qaMask = qa.bitwiseAnd(cloudBitMask).eq(0)
+               .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+
+  var scl = image.select('SCL');
+  var sclMask = scl.neq(3)   // cloud shadow
+                .and(scl.neq(8))
+                .and(scl.neq(9))
+                .and(scl.neq(10))
+                .and(scl.neq(11)); // snow
+
+  return image.updateMask(qaMask)
+              .updateMask(sclMask)
+              .divide(10000)
+              .clamp(0, 1)
+              .copyProperties(image, image.propertyNames());
+}
+
+
+// ============================
+// 2) Add vegetation indices
+// ============================
+function addVegetationIndices(image) {
+  var nir   = image.select('B8');
+  var red   = image.select('B4');
+  var green = image.select('B3');
+  var blue  = image.select('B2');
+  var swir1 = image.select('B11');
+
+  var ndvi  = nir.subtract(red).divide(nir.add(red)).rename('NDVI').clamp(-1, 1);
+  var gndvi = nir.subtract(green).divide(nir.add(green)).rename('GNDVI').clamp(-1, 1);
+
+  var evi = image.expression(
+    '2.5 * (NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1)',
+    {'NIR': nir, 'RED': red, 'BLUE': blue}
+  ).rename('EVI').clamp(-1, 3);
+
+  var evi2 = image.expression(
+    '2.5 * (NIR - RED) / (NIR + 2.4 * RED + 1)',
+    {'NIR': nir, 'RED': red}
+  ).rename('EVI2').clamp(-1, 3);
+
+  var dvi  = nir.subtract(red).rename('DVI');
+  var gdvi = nir.subtract(green).rename('GDVI');
+  var rvi  = nir.divide(red).rename('RVI').clamp(0, 20);
+
+  var savi = image.expression(
+    '(1.5 * (NIR - RED)) / (NIR + RED + 0.5)',
+    {'NIR': nir, 'RED': red}
+  ).rename('SAVI').clamp(-1, 1);
+
+  var osavi = image.expression(
+    '(NIR - RED) / (NIR + RED + 0.16)',
+    {'NIR': nir, 'RED': red}
+  ).rename('OSAVI').clamp(-1, 1);
+
+  var msavi = image.expression(
+    '0.5 * (2 * NIR + 1 - sqrt(pow(2 * NIR + 1, 2) - 8 * (NIR - RED)))',
+    {'NIR': nir, 'RED': red}
+  ).rename('MSAVI').clamp(-1, 1);
+
+  var ndpi = image.expression(
+    '(NIR - (0.74 * RED + 0.26 * SWIR1)) / (NIR + (0.74 * RED + 0.26 * SWIR1))',
+    {'NIR': nir, 'RED': red, 'SWIR1': swir1}
+  ).rename('NDPI').clamp(-1, 1);
+
+  return image.addBands([ndvi, gndvi, evi, evi2, dvi, gdvi, rvi, savi, osavi, msavi, ndpi]);
+}
+
+
+// ============================
+// 3) Load S2 collection
+// ============================
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(region)
+  .filterDate(startDate, endDate)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', cloudPctMax))
+  .map(maskS2sr)
+  .map(addVegetationIndices);
+
+print('S2 image count:', s2.size());
+
+// Mean composites
+var bandsMean = s2.select(s2Bands).mean().clip(region);
+var viMean    = s2.select(viNames).mean().clip(region);
+
+
+// ============================
+// 4) GLCM textures per band
+// ============================
+function getBandTextures(img, bandName) {
+  // glcmTexture requires integer input
+  var scaled = img.select(bandName).multiply(255).toInt();
+  var tex = scaled.glcmTexture({size: glcmSize}).clip(region);
+
+  if (exportAllTextureMetrics) {
+    return tex;
+  } else {
+    var names = keepMetrics.map(function(m){ return bandName + '_' + m; });
+    return tex.select(names);
+  }
+}
+
+
+// ============================
+// 5) Collect all texture bands (optional bookkeeping)
+// NOTE: This list is not required for exports below; the actual exports
+// are handled via tex.bandNames().evaluate() inside each band loop.
+// ============================
+var allTextureBands = [];
+
+s2Bands.forEach(function(bn){
+  var tex = getBandTextures(bandsMean, bn);
+
+  // Get all texture band names for this input band
+  var texBandNames = tex.bandNames();
+
+  texBandNames.evaluate(function(names){
+    if (!names) {
+      print('Warning: No texture bands found for:', bn);
+      return;
+    }
+
+    // Append metadata for each texture band (for reference)
+    names.forEach(function(texName){
+      allTextureBands.push({
+        band: bn,
+        texture: texName,
+        image: tex.select([texName])
+      });
+    });
+  });
+});
+
+print('Total texture band records (client-side list) currently:', allTextureBands.length);
+
+
+// ============================
+// 6) Export: everything as single-band outputs
+// ============================
+
+// 6.1 Export each S2 band mean (single band)
+print('===== Exporting S2 Bands (single-band) =====');
+s2Bands.forEach(function(bn){
+  var name = bn + '_mean_' + dateTag;
+  Export.image.toDrive({
+    image: bandsMean.select([bn]),  // single band
+    description: name,
+    fileNamePrefix: name,
+    folder: outFolder,
+    region: region,
+    scale: exportScale,
+    crs: exportCRS,
+    maxPixels: maxPixels,
+    formatOptions: { cloudOptimized: true }
+  });
+  print('Task created:', name);
+});
+
+// 6.2 Export each vegetation index mean (single band)
+print('===== Exporting Vegetation Indices (single-band) =====');
+viNames.forEach(function(vn){
+  var name = vn + '_mean_' + dateTag;
+  Export.image.toDrive({
+    image: viMean.select([vn]),  // single band
+    description: name,
+    fileNamePrefix: name,
+    folder: outFolder,
+    region: region,
+    scale: exportScale,
+    crs: exportCRS,
+    maxPixels: maxPixels,
+    formatOptions: { cloudOptimized: true }
+  });
+  print('Task created:', name);
+});
+
+// 6.3 Export textures for each band (each texture metric as a separate export)
+print('===== Exporting Texture Features (single-band) =====');
+s2Bands.forEach(function(bn){
+  var tex = getBandTextures(bandsMean, bn);
+
+  // Get texture band name list
+  tex.bandNames().evaluate(function(texNames){
+    if (!texNames) {
+      print('Warning: Texture bandNames undefined for:', bn);
+      return;
+    }
+
+    // Create one export task per texture metric
+    texNames.forEach(function(tn){
+      var name = tn + '_' + dateTag;  // e.g., B2_asm_20240501_20240930
+
+      Export.image.toDrive({
+        image: tex.select([tn]),      // single-band texture
+        description: name,
+        fileNamePrefix: name,
+        folder: outFolder,
+        region: region,
+        scale: exportScale,
+        crs: exportCRS,
+        maxPixels: maxPixels,
+        formatOptions: { cloudOptimized: true }
+      });
+      print('Task created:', name);
+    });
+
+    print('Created', texNames.length, 'texture export tasks for band:', bn);
+  });
+});
+
+
+// ============================
+// 7) Summary
+// ============================
+print('===========================================');
+print('Export Configuration Summary:');
+print('Date range:', startDate, 'to', endDate);
+print('S2 bands to export:', s2Bands.length);
+print('Vegetation indices to export:', viNames.length);
+print('GLCM window size:', glcmSize, 'x', glcmSize);
+print('Export all texture metrics:', exportAllTextureMetrics);
+if (!exportAllTextureMetrics) {
+  print('Selected metrics:', keepMetrics);
+}
+print('Output folder:', outFolder);
+print('Export scale:', exportScale, 'm');
+print('Export CRS:', exportCRS);
+print('===========================================');
+print('Expected total tasks (approx.):');
+print('  - S2 bands:', s2Bands.length);
+print('  - Vegetation indices:', viNames.length);
+print('  - Texture features: ~', s2Bands.length * (exportAllTextureMetrics ? 18 : keepMetrics.length));
+print('  - TOTAL: ~', s2Bands.length + viNames.length + s2Bands.length * (exportAllTextureMetrics ? 18 : keepMetrics.length));
+print('===========================================');
+print('All export tasks have been created.');
+print('Please check the Tasks tab and click RUN ALL.');
