@@ -1,0 +1,192 @@
+# -*- coding: utf-8 -*-
+"""
+Purpose:
+    Extract GEDI L4A AGBD samples from multiple .h5 files, apply basic quality filtering
+    and a study-area bounding-box filter, then export the results to CSV (txt) and Shapefile.
+
+Inputs:
+    - A folder containing GEDI L4A .h5 files
+    - A study-area boundary shapefile (used only for its bounding box)
+
+Outputs:
+    - GEDI_AGBD.txt  (CSV-formatted text file)
+    - GEDI_AGBD.shp  (point Shapefile, EPSG:4326)
+
+Notes:
+    - This script filters by:
+        l4_quality_flag != 0, degrade_flag < 1, sensitivity >= 0.95,
+        agbd >= 0, and PI_lower <= agbd <= PI_upper
+    - Spatial filtering is done using the ROI bounding box (xmin/xmax/ymin/ymax),
+      not a polygon intersection.
+"""
+
+import os
+import glob
+import time
+import h5py
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+
+
+# =========================
+# 0) User configuration (EDIT THESE)
+# =========================
+H5_DIR = r"PATH_TO_YOUR_H5_FOLDER"          # e.g., r"D:\GEDI\L4A_h5"
+ROI_SHP = r"PATH_TO_YOUR_ROI_SHAPEFILE"     # e.g., r"D:\roi\study_area.shp"
+OUTPUT_DIR = r"PATH_TO_OUTPUT_FOLDER"       # e.g., r"D:\GEDI\outputs"
+
+# Filtering thresholds
+SENSITIVITY_MIN = 0.95
+AGBD_MIN = 0.0
+
+# Output filenames
+OUT_TXT_NAME = "GEDI_AGBD.txt"   # CSV-formatted .txt
+OUT_SHP_NAME = "GEDI_AGBD.shp"
+
+
+# =========================
+# 1) Start timer
+# =========================
+t1 = time.time()
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Initialize storage
+data = {
+    "Beam": [],
+    "Latitude": [],
+    "Longitude": [],
+    "AGBD (Mg/ha)": [],
+    "AGBD_PI_LOWER": [],
+    "AGBD_PI_UPPER": [],
+    "Quality Flag": [],
+    "Degrade Flag": [],
+    "Sensitivity": [],
+    "AGBD_LOW": [],
+    "AGBD_HIGH": []
+}
+
+# =========================
+# 2) Collect all H5 files
+# =========================
+h5_files = sorted(glob.glob(os.path.join(H5_DIR, "*.h5")))
+print(f"Found {len(h5_files)} H5 files to process.")
+
+# =========================
+# 3) Loop over H5 files and extract variables
+# =========================
+for idx, filepath in enumerate(h5_files, start=1):
+    filename = os.path.basename(filepath)
+    print(f"Processing file {idx}/{len(h5_files)}: {filename}")
+
+    with h5py.File(filepath, "r") as gedi:
+        beam_names = [g for g in gedi.keys() if g.startswith("BEAM")]
+        if not beam_names:
+            print(f"  [WARN] No BEAM groups found in {filename}. Skipped.")
+            continue
+
+        for beam in beam_names:
+            grp = gedi[beam]
+
+            # Check if the group contains geolocation fields
+            if ("lat_lowestmode" in grp) and ("lon_lowestmode" in grp):
+                print(f"  Extracting beam: {beam}")
+
+                count = len(grp["shot_number"][()])
+
+                data["Beam"].extend([beam] * count)
+                data["Latitude"].extend(grp["lat_lowestmode"][()].astype(np.float32))
+                data["Longitude"].extend(grp["lon_lowestmode"][()].astype(np.float32))
+                data["AGBD (Mg/ha)"].extend(grp["agbd"][()].astype(np.float32))
+                data["AGBD_PI_LOWER"].extend(grp["agbd_pi_lower"][()].astype(np.float32))
+                data["AGBD_PI_UPPER"].extend(grp["agbd_pi_upper"][()].astype(np.float32))
+                data["Quality Flag"].extend(grp["l4_quality_flag"][()].astype(np.int8))
+                data["Degrade Flag"].extend(grp["degrade_flag"][()].astype(np.int8))
+                data["Sensitivity"].extend(grp["sensitivity"][()].astype(np.float32))
+
+                # Optional fields (may not exist)
+                if "agbd_low" in grp:
+                    data["AGBD_LOW"].extend(grp["agbd_low"][()].astype(np.float32))
+                else:
+                    data["AGBD_LOW"].extend([np.nan] * count)
+
+                if "agbd_high" in grp:
+                    data["AGBD_HIGH"].extend(grp["agbd_high"][()].astype(np.float32))
+                else:
+                    data["AGBD_HIGH"].extend([np.nan] * count)
+
+            else:
+                print(f"  [WARN] Beam {beam} missing lat/lon lowestmode. Skipped.")
+
+    print(f"  Done: {filename}")
+
+
+# =========================
+# 4) Build DataFrame
+# =========================
+print("[INFO] Converting extracted lists to DataFrame...")
+allDF = pd.DataFrame(data)
+print(f"[INFO] Total raw records: {len(allDF)}")
+
+# Make sure numeric columns are numeric (safe conversion)
+numeric_cols = [
+    "Latitude", "Longitude", "AGBD (Mg/ha)", "AGBD_PI_LOWER", "AGBD_PI_UPPER",
+    "Quality Flag", "Degrade Flag", "Sensitivity", "AGBD_LOW", "AGBD_HIGH"
+]
+for c in numeric_cols:
+    allDF[c] = pd.to_numeric(allDF[c], errors="coerce")
+
+
+# =========================
+# 5) Read ROI bounds (bbox only)
+# =========================
+gdf_bounds = gpd.read_file(ROI_SHP)
+xmin, ymin, xmax, ymax = gdf_bounds.total_bounds
+print(f"[INFO] ROI bounding box: xmin={xmin}, ymin={ymin}, xmax={xmax}, ymax={ymax}")
+
+# =========================
+# 6) Apply filters
+# =========================
+filtered = allDF[
+    (allDF["Latitude"] >= ymin) & (allDF["Latitude"] <= ymax) &
+    (allDF["Longitude"] >= xmin) & (allDF["Longitude"] <= xmax) &
+    (allDF["Quality Flag"] != 0) &
+    (allDF["Degrade Flag"] < 1) &
+    (allDF["Sensitivity"] >= SENSITIVITY_MIN) &
+    (allDF["AGBD (Mg/ha)"] >= AGBD_MIN) &
+    (allDF["AGBD_PI_LOWER"] <= allDF["AGBD (Mg/ha)"]) &
+    (allDF["AGBD (Mg/ha)"] <= allDF["AGBD_PI_UPPER"])
+].copy()
+
+print(f"[INFO] Records after filtering: {len(filtered)}")
+
+
+# =========================
+# 7) Save outputs
+# =========================
+txt_path = os.path.join(OUTPUT_DIR, OUT_TXT_NAME)
+filtered.to_csv(txt_path, index=False, encoding="utf-8")
+print(f"[OK] Saved CSV-formatted TXT: {txt_path}")
+
+
+def table_to_shp(csv_or_txt_file: str, shp_file: str, lon_col: str, lat_col: str):
+    df = pd.read_csv(csv_or_txt_file)
+    gdf = gpd.GeoDataFrame(
+        df,
+        geometry=gpd.points_from_xy(df[lon_col], df[lat_col]),
+        crs="EPSG:4326"
+    )
+    gdf.to_file(shp_file)
+    print(f"[OK] Saved Shapefile: {shp_file}")
+
+
+shp_path = os.path.join(OUTPUT_DIR, OUT_SHP_NAME)
+table_to_shp(txt_path, shp_path, "Longitude", "Latitude")
+
+
+# =========================
+# 8) End timer
+# =========================
+t2 = time.time()
+print(f"[DONE] Completed in {t2 - t1:.2f} seconds.")
