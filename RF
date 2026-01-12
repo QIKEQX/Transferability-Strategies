@@ -1,0 +1,141 @@
+# -*- coding: utf-8 -*-
+"""
+RF regression training (baseline "original code")
+- input: CSV/Excel
+- output: metrics + model + predictions
+
+Usage:
+  python rf_train.py --input data.xlsx --target AGBD --out_dir outputs/rf
+"""
+
+import os
+import argparse
+import json
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+
+try:
+    import joblib
+except Exception:
+    joblib = None
+
+
+def read_table(path: str) -> pd.DataFrame:
+    ext = os.path.splitext(path)[1].lower()
+    if ext in [".xlsx", ".xls"]:
+        return pd.read_excel(path)
+    return pd.read_csv(path, encoding="utf-8", engine="python")
+
+
+def rmse(y_true, y_pred) -> float:
+    return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", required=True, help="CSV or Excel file")
+    ap.add_argument("--target", required=True, help="Target column name, e.g., AGBD")
+    ap.add_argument("--test_size", type=float, default=0.2)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--out_dir", default="rf_outputs")
+    ap.add_argument("--tune", action="store_true", help="Use RandomizedSearchCV hyperparameter tuning")
+    args = ap.parse_args()
+
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    df = read_table(args.input)
+    if args.target not in df.columns:
+        raise ValueError(f"Target '{args.target}' not found. Columns: {df.columns.tolist()}")
+
+    # keep numeric features only (remote sensing predictors are usually numeric)
+    y = pd.to_numeric(df[args.target], errors="coerce")
+    X = df.drop(columns=[args.target]).apply(pd.to_numeric, errors="coerce")
+
+    # drop rows where y is NaN
+    valid = np.isfinite(y.to_numpy())
+    X = X.loc[valid].copy()
+    y = y.loc[valid].copy()
+
+    if len(X) < 30:
+        raise ValueError(f"Too few samples after cleaning: {len(X)}")
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=args.test_size, random_state=args.seed
+    )
+
+    # pipeline: impute -> RF
+    rf = RandomForestRegressor(
+        random_state=args.seed,
+        n_jobs=-1,
+        bootstrap=True,
+        oob_score=False
+    )
+    pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("model", rf)
+    ])
+
+    best_estimator = pipe
+
+    if args.tune:
+        # simple but practical search space (you can expand)
+        param_dist = {
+            "model__n_estimators": [200, 300, 500, 800],
+            "model__max_depth": [None, 6, 10, 14, 18],
+            "model__min_samples_split": [2, 5, 10, 20],
+            "model__min_samples_leaf": [1, 2, 4, 8],
+            "model__max_features": ["sqrt", "log2", 0.3, 0.5, 0.7],
+        }
+        search = RandomizedSearchCV(
+            estimator=pipe,
+            param_distributions=param_dist,
+            n_iter=40,
+            scoring="r2",
+            cv=5,
+            random_state=args.seed,
+            n_jobs=-1,
+            verbose=1
+        )
+        search.fit(X_train, y_train)
+        best_estimator = search.best_estimator_
+
+        with open(os.path.join(args.out_dir, "best_params.json"), "w", encoding="utf-8") as f:
+            json.dump(search.best_params_, f, indent=2)
+
+        print("[TUNING] best R2 (cv):", search.best_score_)
+        print("[TUNING] best params saved to best_params.json")
+
+    # train final model
+    best_estimator.fit(X_train, y_train)
+
+    # evaluate
+    pred = best_estimator.predict(X_test)
+    r2 = float(r2_score(y_test, pred))
+    mae = float(mean_absolute_error(y_test, pred))
+    rmse_val = rmse(y_test, pred)
+
+    metrics = {"R2": r2, "MAE": mae, "RMSE": rmse_val, "n_train": int(len(X_train)), "n_test": int(len(X_test))}
+    print("[TEST]", metrics)
+
+    with open(os.path.join(args.out_dir, "metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
+
+    out_pred = pd.DataFrame({"y_true": y_test.to_numpy(), "y_pred": pred})
+    out_pred.to_csv(os.path.join(args.out_dir, "predictions_test.csv"), index=False, encoding="utf-8-sig")
+
+    # save model
+    if joblib is not None:
+        joblib.dump(best_estimator, os.path.join(args.out_dir, "rf_model.joblib"))
+        print("[OK] model saved: rf_model.joblib")
+    else:
+        print("[WARN] joblib not available, skip model saving.")
+
+
+if __name__ == "__main__":
+    main()
