@@ -1,0 +1,172 @@
+# -*- coding: utf-8 -*-
+"""
+Repeated K-Fold CV runner for RF / XGBoost.
+- 5-fold x 30 repeats by default
+- Save per-fold results and summary
+
+Usage:
+  python cv_run.py --input data.xlsx --target AGBD --model rf  --out_dir outputs/cv_rf
+  python cv_run.py --input data.xlsx --target AGBD --model xgb --out_dir outputs/cv_xgb --early_stopping_rounds 50
+"""
+
+import os
+import argparse
+import json
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import KFold
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+from sklearn.ensemble import RandomForestRegressor
+
+from xgboost import XGBRegressor
+
+
+def read_table(path: str) -> pd.DataFrame:
+    ext = os.path.splitext(path)[1].lower()
+    if ext in [".xlsx", ".xls"]:
+        return pd.read_excel(path)
+    return pd.read_csv(path, encoding="utf-8", engine="python")
+
+
+def rmse(y_true, y_pred) -> float:
+    return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+
+
+def build_rf(seed: int):
+    return RandomForestRegressor(
+        n_estimators=300,
+        max_depth=None,
+        min_samples_split=2,
+        min_samples_leaf=1,
+        max_features="sqrt",
+        random_state=seed,
+        n_jobs=-1,
+        bootstrap=True
+    )
+
+
+def build_xgb(seed: int):
+    # n_estimators set large; early stopping will choose best_iteration
+    return XGBRegressor(
+        objective="reg:squarederror",
+        n_estimators=5000,
+        learning_rate=0.01,
+        max_depth=3,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_lambda=1.0,
+        random_state=seed,
+        n_jobs=-1
+    )
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", required=True)
+    ap.add_argument("--target", required=True)
+    ap.add_argument("--model", choices=["rf", "xgb"], required=True)
+    ap.add_argument("--folds", type=int, default=5)
+    ap.add_argument("--repeats", type=int, default=30)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--out_dir", default="cv_outputs")
+    ap.add_argument("--early_stopping_rounds", type=int, default=50)  # xgb only
+    ap.add_argument("--eval_frac_in_fold", type=float, default=0.2)    # xgb only
+    args = ap.parse_args()
+
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    df = read_table(args.input)
+    if args.target not in df.columns:
+        raise ValueError(f"Target '{args.target}' not found. Columns: {df.columns.tolist()}")
+
+    y = pd.to_numeric(df[args.target], errors="coerce")
+    X = df.drop(columns=[args.target]).apply(pd.to_numeric, errors="coerce")
+
+    valid = np.isfinite(y.to_numpy())
+    X = X.loc[valid].copy()
+    y = y.loc[valid].copy()
+
+    if len(X) < 30:
+        raise ValueError(f"Too few samples after cleaning: {len(X)}")
+
+    X_np = X.to_numpy()
+    y_np = y.to_numpy()
+
+    rows = []
+    for rep in range(args.repeats):
+        rep_seed = args.seed + rep
+        kf = KFold(n_splits=args.folds, shuffle=True, random_state=rep_seed)
+
+        for fold, (tr_idx, te_idx) in enumerate(kf.split(X_np), start=1):
+            X_tr, y_tr = X_np[tr_idx], y_np[tr_idx]
+            X_te, y_te = X_np[te_idx], y_np[te_idx]
+
+            # impute
+            imp = SimpleImputer(strategy="median")
+            X_tr_i = imp.fit_transform(X_tr)
+            X_te_i = imp.transform(X_te)
+
+            if args.model == "rf":
+                model = build_rf(rep_seed)
+                model.fit(X_tr_i, y_tr)
+                pred = model.predict(X_te_i)
+                best_iter = None
+
+            else:
+                model = build_xgb(rep_seed)
+
+                # early stopping needs an eval set inside training fold
+                n_tr = X_tr_i.shape[0]
+                n_eval = max(10, int(n_tr * args.eval_frac_in_fold))
+                # simple split: last part as eval (shuffled already by KFold)
+                X_fit, y_fit = X_tr_i[:-n_eval], y_tr[:-n_eval]
+                X_eval, y_eval = X_tr_i[-n_eval:], y_tr[-n_eval:]
+
+                model.fit(
+                    X_fit, y_fit,
+                    eval_set=[(X_eval, y_eval)],
+                    verbose=False,
+                    early_stopping_rounds=args.early_stopping_rounds
+                )
+                pred = model.predict(X_te_i)
+                best_iter = int(getattr(model, "best_iteration", -1))
+
+            r2 = float(r2_score(y_te, pred))
+            mae = float(mean_absolute_error(y_te, pred))
+            rmse_val = rmse(y_te, pred)
+
+            rows.append({
+                "repeat": rep + 1,
+                "fold": fold,
+                "R2": r2,
+                "MAE": mae,
+                "RMSE": rmse_val,
+                "best_iteration": best_iter
+            })
+
+    df_out = pd.DataFrame(rows)
+    df_out.to_csv(os.path.join(args.out_dir, "cv_all_folds.csv"), index=False, encoding="utf-8-sig")
+
+    summary = {
+        "model": args.model,
+        "folds": args.folds,
+        "repeats": args.repeats,
+        "R2_mean": float(df_out["R2"].mean()),
+        "R2_std": float(df_out["R2"].std(ddof=1)),
+        "MAE_mean": float(df_out["MAE"].mean()),
+        "MAE_std": float(df_out["MAE"].std(ddof=1)),
+        "RMSE_mean": float(df_out["RMSE"].mean()),
+        "RMSE_std": float(df_out["RMSE"].std(ddof=1)),
+    }
+
+    with open(os.path.join(args.out_dir, "cv_summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    print("[OK] Saved:", os.path.join(args.out_dir, "cv_all_folds.csv"))
+    print("[OK] Summary:", summary)
+
+
+if __name__ == "__main__":
+    main()
