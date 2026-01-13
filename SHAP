@@ -1,0 +1,199 @@
+# -*- coding: utf-8 -*-
+"""
+Monte Carlo uncertainty propagation for GEDI-based AGB modeling
+- Derive sigma_GEDI from GEDI prediction interval (PI) width
+- Run N Monte Carlo iterations by perturbing training labels and re-training model
+- Output: mean prediction, sigma_total, PI(2.5-97.5), sigma_model via variance decomposition
+
+Author: (you)
+"""
+
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+
+# ---------------------------
+# 0) User settings (EDIT HERE)
+# ---------------------------
+CSV_IN = r"your_training_points.csv"   # must include y, pi_lower, pi_upper, and feature columns
+CSV_OUT = r"mc_uncertainty_output.csv"
+
+# Column names
+Y_COL = "agbd"                 # GEDI AGBD (target)
+PI_LO_COL = "agbd_pi_lower"    # GEDI PI lower
+PI_UP_COL = "agbd_pi_upper"    # GEDI PI upper
+
+# If you want to predict on a separate dataset (e.g., independent points/pixels),
+# set PRED_CSV_IN. Otherwise prediction is done on the training samples (X).
+PRED_CSV_IN = None  # e.g., r"your_prediction_features.csv"
+PRED_CSV_OUT = r"mc_predictions_on_predset.csv"
+
+# Features: if None, will auto-detect numeric columns excluding target & PI columns
+FEATURE_COLS = None
+
+# Monte Carlo
+N_MC = 50
+PI_LEVEL = 0.95
+SEED = 2025
+
+# Choose model: "xgb" or "rf"
+MODEL_TYPE = "xgb"
+
+# XGBoost settings (edit if needed)
+XGB_PARAMS = dict(
+    n_estimators=600,
+    learning_rate=0.05,
+    max_depth=8,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    reg_lambda=1.0,
+    random_state=SEED,
+    n_jobs=-1
+)
+
+# Random Forest settings (edit if needed)
+RF_PARAMS = dict(
+    n_estimators=800,
+    max_depth=None,
+    min_samples_split=2,
+    min_samples_leaf=1,
+    random_state=SEED,
+    n_jobs=-1
+)
+
+
+# ---------------------------
+# 1) Helper: build estimator
+# ---------------------------
+def build_model(model_type: str):
+    model_type = model_type.lower().strip()
+    if model_type == "xgb":
+        from xgboost import XGBRegressor
+        return XGBRegressor(**XGB_PARAMS)
+    elif model_type == "rf":
+        from sklearn.ensemble import RandomForestRegressor
+        return RandomForestRegressor(**RF_PARAMS)
+    else:
+        raise ValueError("MODEL_TYPE must be 'xgb' or 'rf'.")
+
+
+# ---------------------------
+# 2) Helper: derive sigma from PI
+# ---------------------------
+def sigma_from_pi(pi_low: np.ndarray, pi_up: np.ndarray, pi_level: float = 0.95) -> np.ndarray:
+    """
+    Assume PI is approximately symmetric normal interval:
+    PI = mean ± z * sigma, where z = norm.ppf(0.5 + pi_level/2)
+    => sigma = (pi_up - pi_low) / (2*z)
+    """
+    z = norm.ppf(0.5 + pi_level / 2.0)
+    width = np.maximum(0.0, pi_up - pi_low)
+    sigma = width / (2.0 * z + 1e-12)
+    return sigma
+
+
+# ---------------------------
+# 3) Load data
+# ---------------------------
+df = pd.read_csv(CSV_IN)
+
+# Auto feature detection
+if FEATURE_COLS is None:
+    exclude = {Y_COL, PI_LO_COL, PI_UP_COL}
+    numeric_cols = [c for c in df.columns if c not in exclude and pd.api.types.is_numeric_dtype(df[c])]
+    FEATURE_COLS = numeric_cols
+
+if len(FEATURE_COLS) == 0:
+    raise ValueError("No feature columns detected. Please set FEATURE_COLS manually.")
+
+# Clean rows
+needed_cols = [Y_COL, PI_LO_COL, PI_UP_COL] + FEATURE_COLS
+df2 = df[needed_cols].copy()
+df2 = df2.replace([np.inf, -np.inf], np.nan).dropna()
+
+X = df2[FEATURE_COLS].to_numpy(dtype=float)
+y = df2[Y_COL].to_numpy(dtype=float)
+pi_lo = df2[PI_LO_COL].to_numpy(dtype=float)
+pi_up = df2[PI_UP_COL].to_numpy(dtype=float)
+
+sigma_gedi = sigma_from_pi(pi_lo, pi_up, pi_level=PI_LEVEL)
+
+if len(y) < 30:
+    print(f"[WARN] Effective samples = {len(y)}. Monte Carlo results may be unstable.")
+
+# Prediction set (optional)
+if PRED_CSV_IN is not None:
+    df_pred = pd.read_csv(PRED_CSV_IN)
+    df_pred = df_pred.replace([np.inf, -np.inf], np.nan).dropna(subset=FEATURE_COLS)
+    X_pred = df_pred[FEATURE_COLS].to_numpy(dtype=float)
+else:
+    df_pred = None
+    X_pred = X
+
+
+# ---------------------------
+# 4) Monte Carlo loop
+# ---------------------------
+rng = np.random.default_rng(SEED)
+
+preds = np.zeros((N_MC, X_pred.shape[0]), dtype=float)
+
+for i in range(N_MC):
+    # Perturb labels using GEDI measurement uncertainty (pointwise)
+    eps = rng.normal(loc=0.0, scale=sigma_gedi, size=y.shape[0])
+    y_mc = y + eps
+
+    model = build_model(MODEL_TYPE)
+    model.fit(X, y_mc)
+
+    preds[i, :] = model.predict(X_pred)
+
+    if (i + 1) % 10 == 0:
+        print(f"[MC] {i+1}/{N_MC} done.")
+
+# ---------------------------
+# 5) Summarize uncertainty
+# ---------------------------
+pred_mean = np.mean(preds, axis=0)
+pred_std = np.std(preds, axis=0, ddof=1)  # sigma_total (ensemble SD)
+
+q_lo = np.quantile(preds, 0.025, axis=0)
+q_hi = np.quantile(preds, 0.975, axis=0)
+
+# Variance decomposition (only strictly meaningful on GEDI points where sigma_gedi exists)
+# If predicting on external set, you can still report sigma_total and PI; sigma_model needs sigma_gedi for that set.
+if df_pred is None:
+    # same set as training points
+    sigma_total = pred_std
+    sigma_model = np.sqrt(np.maximum(0.0, sigma_total**2 - sigma_gedi**2))
+
+    frac_gedi = np.where(sigma_total > 0, (sigma_gedi**2) / (sigma_total**2 + 1e-12), np.nan)
+    frac_model = np.where(sigma_total > 0, (sigma_model**2) / (sigma_total**2 + 1e-12), np.nan)
+
+    out = df2.copy()
+    out["pred_mean"] = pred_mean
+    out["sigma_total"] = sigma_total
+    out["pi2p5"] = q_lo
+    out["pi97p5"] = q_hi
+    out["sigma_GEDI"] = sigma_gedi
+    out["sigma_model"] = sigma_model
+    out["varfrac_GEDI"] = frac_gedi
+    out["varfrac_model"] = frac_model
+
+    out.to_csv(CSV_OUT, index=False, encoding="utf-8-sig")
+    print(f"[OK] Saved: {CSV_OUT}")
+
+    print("[SUMMARY]")
+    print(f"Mean var fraction (GEDI):  {np.nanmean(frac_gedi)*100:.1f}%")
+    print(f"Mean var fraction (Model): {np.nanmean(frac_model)*100:.1f}%")
+
+else:
+    # external prediction set
+    out_pred = df_pred.copy()
+    out_pred["pred_mean"] = pred_mean
+    out_pred["sigma_total"] = pred_std
+    out_pred["pi2p5"] = q_lo
+    out_pred["pi97p5"] = q_hi
+    out_pred.to_csv(PRED_CSV_OUT, index=False, encoding="utf-8-sig")
+    print(f"[OK] Saved: {PRED_CSV_OUT}")
+    print("[NOTE] sigma_model decomposition requires sigma_GEDI for the prediction set.")
